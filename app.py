@@ -1,21 +1,15 @@
-# Streamlit demo: Restaurant Location Selector — Simplified for Non-technical Users
-# -------------------------------------------------
-# Simplified, user-friendly demo. Assumptions:
-# - Map uses OpenStreetMap (folium) only.
-# - Data is provided by the backend in production. For the demo we generate synthetic
-#   California-centered data so the map shows CA.
-# - Weight adjustments are simplified to *three* group sliders (Demographic, Competition,
-#   Site-specific). No per-feature sliders, no advanced map settings.
-# - UI is intentionally simple for middle → upper-middle aged restaurant owners.
-# -------------------------------------------------
-
-import os
-import numpy as np
-import pandas as pd
 import streamlit as st
-from io import StringIO
+import pandas as pd
+import numpy as np
+import folium
+import DataPipeline
+import dictionaries
 
-# Try to import folium + streamlit_folium. If unavailable, show friendly message.
+st.set_page_config(
+    page_title="Restaurant Site Selector",
+    layout="wide"
+)
+
 try:
     import folium
     from streamlit_folium import st_folium
@@ -23,294 +17,285 @@ try:
 except Exception:
     _FOLIUM_OK = False
 
-st.set_page_config(page_title="Restaurant Location Selector — Simple Demo", layout="wide")
-
 # -------------------------
-# 1) Demo data generator (California-centered)
+# 1) Load data needed for input ranges
 # -------------------------
 
-def make_demo_data(seed: int = 7, n: int = 40,
-                   center=(36.7783, -119.4179)) -> pd.DataFrame:
-    """Generate synthetic CA-centered candidates. In production, backend will supply real data.
-    """
-    rng = np.random.default_rng(seed)
-    lat0, lon0 = center
-    lat = lat0 + (rng.normal(0, 0.6, n))  # wider spread to cover CA
-    lon = lon0 + (rng.normal(0, 1.4, n))
+@st.cache_data
+def get_site_level_df():
+    site_level_df, _, _ = DataPipeline.data_cleaning()
+    return site_level_df
 
-    population_density = rng.normal(3000, 1200, n).clip(300, 15000)
-    median_income = rng.normal(70000, 18000, n).clip(20000, 200000)
-    asian_pop_share = rng.uniform(0.01, 0.4, n)
-    foot_traffic = rng.normal(1500, 700, n).clip(50, 10000)
-    competitor_count = rng.poisson(5, n) + rng.integers(0, 4, n)
-    rent_per_sqft = rng.normal(30, 10, n).clip(8, 150)
-    crime_index = rng.normal(45, 15, n).clip(5, 100)
-    rating = rng.normal(4.0, 0.4, n).clip(2.5, 5.0)
-    growth_index = rng.normal(1.03, 0.07, n).clip(0.8, 1.4)
-    size_sqft = rng.integers(600, 4000, n)
-    parking = rng.choice([0, 1], size=n, p=[0.4, 0.6])
-    cuisine = rng.choice(["Asian", "Italian", "Mexican", "American", "Coffee"], size=n)
+site_level_df = get_site_level_df()
+Avg_SqFt_range = site_level_df["Avg_SqFt"].agg(["min", "max"])
 
-    df = pd.DataFrame({
-        "name": [f"Candidate #{i+1}" for i in range(n)],
-        "lat": lat,
-        "lon": lon,
-        "population_density": population_density,
-        "median_income": median_income,
-        "asian_pop_share": asian_pop_share,
-        "foot_traffic": foot_traffic,
-        "competitor_count": competitor_count,
-        "rent_per_sqft": rent_per_sqft,
-        "crime_index": crime_index,
-        "rating": rating,
-        "growth_index": growth_index,
-        "size_sqft": size_sqft,
-        "parking": parking,
-        "cuisine": cuisine,
-    })
-    return df
+# -------------------------
+# 2) Sidebar – user inputs
+# -------------------------
 
-# In production this variable will be filled by the backend. For demo, generate CA data.
-data = make_demo_data()
+st.sidebar.title("Your Restaurant Preferences")
 
-# ------------------------------------
-# 2) Very simple staged inputs (wizard-style hints)
-# ------------------------------------
-st.sidebar.header("Step 1 — Demographic")
-population_level = st.sidebar.selectbox("Location type", ["Small town", "Suburban", "City"], index=2)
-market_saturation = st.sidebar.selectbox("Market saturation", ["Developing", "Mature"], index=0)
-preferred_cuisines = st.sidebar.multiselect("Cuisine types (pick one or two)", sorted(data["cuisine"].unique()), default=["Asian"]) 
+# ---- Top-level weights (Demo / Comp / Site) ----
+st.sidebar.subheader("Step 1 – What matters most?")
 
-st.sidebar.header("Step 2 — Competition")
-competition_sensitivity = st.sidebar.selectbox("How much do you care about nearby competitors?", ["Not much", "Somewhat", "Very much"], index=1)
+demo_raw = st.sidebar.slider("Demographics importance", 0.0, 1.0, 0.4, 0.05)
+comp_raw = st.sidebar.slider("Competition importance", 0.0, 1.0, 0.4, 0.05)
+site_raw = st.sidebar.slider("Site (rent & size) importance", 0.0, 1.0, 0.2, 0.05)
 
-st.sidebar.header("Step 3 — Site preferences")
-rent_min, rent_max = st.sidebar.slider("Desired rent $/sqft (range)", 5, 200, (5, 60))
-size_min, size_max = st.sidebar.slider("Wanted size (sqft)", 200, 5000, (800, 2000))
-parking_pref = st.sidebar.checkbox("Prefer listings with more parking", value=False)
+total_raw = demo_raw + comp_raw + site_raw
+if total_raw == 0:
+    Demo_weight = 0.4
+    Comp_weight = 0.4
+    Site_weight = 0.2
+else:
+    Demo_weight = demo_raw / total_raw
+    Comp_weight = comp_raw / total_raw
+    Site_weight = site_raw / total_raw
 
-# ------------------------------------
-# 3) Simple weight controls: only three group sliders
-# ------------------------------------
-st.sidebar.header("Adjust what matters most")
-st.sidebar.markdown("Use these three sliders to say what matters most: Demographics, Competition, or Site factors.")
-st.sidebar.markdown("<div class='step-badge'><div class='step-number'>1</div><div style='margin-left:6px'><div class='step-label'>Demographics</div><div style='font-size:12px;color:#3f536b'></div></div></div>", unsafe_allow_html=True)
-group_demo_mult = st.sidebar.slider("How important is having a big audience closeby matter to you?", 0.0, 2.0, 1.0, 0.05)
-st.sidebar.markdown("<div class='step-badge'><div class='step-number'>2</div><div style='margin-left:6px'><div class='step-label'>Competition</div><div style='font-size:12px;color:#3f536b'>Set how much nearby competitors matter</div></div></div>", unsafe_allow_html=True)
-group_comp_mult = st.sidebar.slider("How much do you care about having nearby competitors?", 0.0, 2.0, 1.0, 0.05)
-st.sidebar.markdown("<div class='step-badge'><div class='step-number'>3</div><div style='margin-left:6px'><div class='step-label'>Site</div><div style='font-size:12px;color:#3f536b'>Pick size, rent, and parking preference</div></div></div>", unsafe_allow_html=True)
-group_site_mult = st.sidebar.slider("How important is the site's specifications matching your needs?", 0.0, 2.0, 1.0, 0.05)
+st.sidebar.markdown(
+    f"**Normalized weights**  \n"
+    f"- Demographic: `{Demo_weight:.2f}`  \n"
+    f"- Competition: `{Comp_weight:.2f}`  \n"
+    f"- Site: `{Site_weight:.2f}`"
+)
 
-
-# Build simple weight dictionary from group multipliers
-# We map groups to the original feature set but only via these three multipliers.
-BASE_WEIGHTS = {
-    "population_density": (1.0, +1),
-    "median_income": (1.0, +1),
-    "asian_pop_share": (1.0, +1),
-    "competitor_count": (1.0, -1),
-    "rent_per_sqft": (1.0, -1),
-    "foot_traffic": (1.0, +1),
-    "crime_index": (1.0, -1),
-    "growth_index": (1.0, +1),
+weights = {
+    "Demo_weight": Demo_weight,
+    "Comp_weight": Comp_weight,
+    "Site_weight": Site_weight,
 }
 
-WEIGHTS = {}
-for k, (base, direction) in BASE_WEIGHTS.items():
-    if k in ["population_density", "median_income", "asian_pop_share"]:
-        w = base * group_demo_mult
-    elif k in ["competitor_count", "rent_per_sqft"]:
-        w = base * group_comp_mult
-    else:
-        w = base * group_site_mult
-    WEIGHTS[k] = (w, direction)
+# ---- Restaurant Type (Cuisine) ----
+st.sidebar.subheader("Step 2 – Restaurant type")
 
-# ------------------------------------
-# 4) Score helpers
-# ------------------------------------
-
-def zscore(s: pd.Series) -> pd.Series:
-    mu, sigma = s.mean(), s.std(ddof=0)
-    if sigma == 0:
-        return pd.Series(0.0, index=s.index)
-    return (s - mu) / sigma
-
-
-def compute_scores(df: pd.DataFrame, weights: dict,
-                   rent_min=0, rent_max=1e9, size_min=0, size_max=1e9, parking_pref=False, cuisines=None):
-    df2 = df.copy()
-    # Apply simple filters from steps (these are friendly and minimal)
-    df2 = df2[(df2["rent_per_sqft"] >= rent_min) & (df2["rent_per_sqft"] <= rent_max)]
-    if "size_sqft" in df2.columns:
-        df2 = df2[(df2["size_sqft"] >= size_min) & (df2["size_sqft"] <= size_max)]
-    if parking_pref and "parking" in df2.columns:
-        df2 = df2[df2["parking"] == 1]
-    if cuisines:
-        if "cuisine" in df2.columns:
-            df2 = df2[df2["cuisine"].isin(cuisines)]
-
-    score_parts = []
-    for col, (w, direction) in weights.items():
-        if col not in df2.columns:
-            continue
-        zs = zscore(df2[col]) * direction
-        score_parts.append(w * zs)
-        df2[f"contrib_{col}"] = w * zs
-
-    df2["score"] = np.sum(score_parts, axis=0) if score_parts else 0.0
-    df2 = df2.sort_values("score", ascending=False)
-    return df2
-
-scored = compute_scores(data, WEIGHTS, rent_min=rent_min, rent_max=rent_max, size_min=size_min, size_max=size_max, parking_pref=parking_pref, cuisines=preferred_cuisines)
-
-# ------------------------------------
-# 5) UI: headline and short explanation
-# ------------------------------------
-
-# Add custom background + styling to make UI cleaner and more official
-st.markdown(
-    """
-    <style>
-    /* Set full-page background */
-    .main {
-        background-color: #ffffff !important;
-    }
-
-    /* Sidebar background */
-    section[data-testid="stSidebar"] {
-        background-color: #000000 !important;
-    }
-
-    /* Make headers more professional */
-    h1, h2, h3, h4, h5, h6 {
-        color: #ffffff !important;
-        font-family: 'Segoe UI', sans-serif !important;
-    }
-
-    /* Improve table readability */
-    .stDataFrame {
-        background-color: black !important;
-    }
-
-    /* Improve button look */
-    .stButton>button {
-        background-color: #2e7cff;
-        color: white;
-        border-radius: 6px;
-        padding: 0.6rem 1.2rem;
-        border: none;
-    }
-    .stButton>button:hover {
-        background-color: #1b5fd6;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+Restaurant_Types = list(dictionaries.asian_food_keywords.keys())
+Restaurant_type_input = st.sidebar.selectbox(
+    "Cuisine (type of Asian restaurant)",
+    options=Restaurant_Types,
+    index=Restaurant_Types.index("Vietnamese") if "Vietnamese" in Restaurant_Types else 0,
 )
 
-# App header + polished UI
-# Use a compact banner, clear numbering, high-contrast text, and icons for visual cues
-st.markdown(
-    """
-    <style>
-    /* Banner */
-    .app-banner {
-        display: flex;
-        align-items: center;
-        gap: 16px;
-        padding: 18px 24px;
-        background: linear-gradient(90deg, #ffffff 0%, #f8fbff 100%);
-        border-radius: 8px;
-        box-shadow: 0 6px 20px rgba(0,0,0,0.06);
-        margin-bottom: 18px;
-    }
-    .app-logo {
-        width: 72px;
-        height: 72px;
-        border-radius: 10px;
-        background: linear-gradient(180deg,#2e7cff,#1b5fd6);
-        display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:28px
-    }
-    .app-title { font-size: 22px; color: #0b243b; margin:0; font-weight:700; }
-    .app-sub { color:#41515f; margin:0; font-size:13px }
+# ---- Site preference: Size ----
+st.sidebar.subheader("Step 3 – Site size preference")
 
-    /* Sidebar step badges */
-    .step-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border-radius:8px; background:#ffffff; box-shadow:0 2px 6px rgba(0,0,0,0.04); margin-bottom:8px }
-    .step-number { background:#2e7cff; color:white; font-weight:700; padding:6px 10px; border-radius:6px }
-    .step-label { font-weight:600; color:black }
+min_sqft = int(Avg_SqFt_range["min"])
+max_sqft = int(Avg_SqFt_range["max"])
+default_sqft = int((min_sqft + max_sqft) / 2)
 
-    /* Increase contrast and size for main headings */
-    .stHeader { color: #000000 !important; font-size:18px !important; }
-
-    /* Make table text larger for readability */
-    .stDataFrame table td, .stDataFrame table th { font-size: 14px !important }
-    </style>
-
-    <div class="app-banner">
-        <div class="app-logo">RS</div>
-        <div>
-            <div class="app-title">Restaurant Location Selector</div>
-            <div class="app-sub">A simple, official-looking tool for evaluating restaurant site candidates</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+Avg_SqFt_input = st.sidebar.slider(
+    "Preferred average square feet",
+    min_value=min_sqft,
+    max_value=max_sqft,
+    value=default_sqft,
+    step=50,
 )
 
-# Sidebar: show numbered steps with icons and short captions (friendly language)
+# ---- Demographic preferences (Low / Medium / High) ----
+st.sidebar.subheader("Step 4 – Area demographics")
 
+Percentage_Asian_Options = ["Low", "Medium", "High"]
+Median_INCTOT_Options = ["Low", "Medium", "High"]
+Median_Yearly_Population_Options = ["Low", "Medium", "High"]
 
-# Short official instruction copy for the main page
-st.markdown("**How to use**: 1) Select a location type and cuisine. 2) Use the Competition slider to set importance. 3) Move the three blue sliders to say what matters most. Click a map marker to view details.", unsafe_allow_html=True)
+Percentage_Asian_choice = st.sidebar.selectbox(
+    "Market saturation (Asian population share)",
+    options=Percentage_Asian_Options,
+    index=2,  # default: High
+)
 
+Median_INCTOT_choice = st.sidebar.selectbox(
+    "Typical income level (customer spending power)",
+    options=Median_INCTOT_Options,
+    index=1,  # default: Medium
+)
 
-# ------------------------------------
-# 6) Map visualization (OpenStreetMap / Folium) centered on California
-# ------------------------------------
+Median_Yearly_Population_choice = st.sidebar.selectbox(
+    "Location type (population size)",
+    options=Median_Yearly_Population_Options,
+    index=1,  # default: Medium
+)
 
-if not _FOLIUM_OK:
-    st.error("This demo requires folium and streamlit-folium. Please install: pip install folium streamlit-folium")
+# Map display labels to the lowercase strings expected by DataPipeline.scaling()
+inputs = {
+    "Restaurant_type_input": Restaurant_type_input,
+    "Avg_SqFt_input": Avg_SqFt_input,
+    "Percentage_Asian_input": Percentage_Asian_choice.lower(),
+    "Median_INCTOT_input": Median_INCTOT_choice.lower(),
+    "Median_Yearly_Population_input": Median_Yearly_Population_choice.lower(),
+}
+
+# -------------------------
+# 3) Main page – run scoring
+# -------------------------
+
+st.title("Restaurant Site Selector")
+st.write(
+    "This tool helps you compare available restaurant sites in California based on "
+    "demographics, competition, and site characteristics tailored to your Asian restaurant."
+)
+
+run_button = st.button("Find Best Locations")
+
+# Initialize session_state to hold results
+if "final_results" not in st.session_state:
+    st.session_state["final_results"] = None
+
+# When button is clicked: compute and store results
+if run_button:
+    with st.spinner("Calculating the best sites for your restaurant..."):
+        st.session_state["final_results"] = DataPipeline.calculate_final_scores(weights, inputs)
+
+# Always read from session_state
+final_merged_df_sorted = st.session_state["final_results"]
+
+if final_merged_df_sorted is None:
+    st.info("Set your preferences in the sidebar, then click **Find Best Locations** to see suggested sites.")
 else:
-    TOP_N = st.slider("How many top locations to show?", 5, 40, 12)
-    center_lat, center_lon = 36.7783, -119.4179
-    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+    if final_merged_df_sorted.empty:
+        st.warning("No sites matched the current filters. Try adjusting your preferences.")
+    else:
+        st.subheader("Top 10 Recommended Locations")
 
-    top_df = scored.head(TOP_N)
-    for _, r in top_df.iterrows():
-        popup_html = f"<b>{r['name']}</b><br>Score: {r['score']:.2f}<br>Rent: ${r['rent_per_sqft']:.2f}/sqft/mo<br>Traffic: {int(r['foot_traffic'])}<br>Competitors: {int(r['competitor_count'])}"
-        folium.CircleMarker(
-            location=[r["lat"], r["lon"]],
-            radius=6 + 10 * ((r["score"] - top_df["score"].min()) / max(1e-6, top_df["score"].max() - top_df["score"].min())) if not top_df.empty else 6,
-            fill=True,
-            fill_opacity=0.8,
-            popup=folium.Popup(popup_html, max_width=300),
-        ).add_to(fmap)
+        map_col, results_col = st.columns([3, 2])
 
-    st_folium(fmap, width=900, height=600)
+        # ------------------ MAP ------------------ #
+        def render_map_from_results(df, center=(36.7783, -119.4179), zoom_start=6):
+            fmap = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap")
+            if df is None or df.empty:
+                return fmap
 
-# ------------------------------------
-# 7) Ranked table + simple explainability
-# ------------------------------------
+            possible_lat_cols = ["lat", "latitude", "Lat", "Latitude"]
+            possible_lon_cols = ["lon", "lng", "longitude", "Longitude", "Lon"]
 
-st.subheader("Top candidates")
-show_cols = ["name", "score", "rent_per_sqft", "median_income", "population_density", "foot_traffic", "competitor_count", "size_sqft", "parking", "cuisine"]
-st.dataframe(scored.head(25)[[c for c in show_cols if c in scored.columns]], use_container_width=True)
+            lat_col = next((c for c in possible_lat_cols if c in df.columns), None)
+            lon_col = next((c for c in possible_lon_cols if c in df.columns), None)
 
-with st.expander("Explain a selected candidate"):
-    options = list(scored["name"].head(25)) if not scored.empty else []
-    pick = st.selectbox("Choose a location", options)
-    if pick:
-        row = scored.loc[scored["name"] == pick].iloc[0]
-        st.markdown(f"**{pick}** — composite score: **{row['score']:.2f}**")
-        contrib_cols = [c for c in scored.columns if c.startswith("contrib_")]
-        explain_df = (row[contrib_cols].rename(lambda c: c.replace("contrib_", "")).to_frame(name="value")).sort_values("value", ascending=False)
-        st.dataframe(explain_df)
+            if lat_col is None or lon_col is None:
+                return fmap
 
-# ------------------------------------
-# 8) Download results
-# ------------------------------------
+            if "fit_score" in df.columns:
+                score_min = df["fit_score"].min()
+                score_max = df["fit_score"].max()
+                score_range = max(score_max - score_min, 1e-6)
+            else:
+                score_min = score_max = None
+                score_range = 1.0
 
-csv = scored.to_csv(index=False).encode("utf-8")
-st.download_button("Download scored candidates (CSV)", csv, file_name="scored_locations_demo.csv")
+            for _, r in df.iterrows():
+                lat = r.get(lat_col)
+                lon = r.get(lon_col)
+                if pd.isna(lat) or pd.isna(lon):
+                    continue
 
-st.caption("This simple demo centers on California and uses only three sliders to keep things easy for non-technical users.")
+                name = r.get("Name", "Candidate")
+                address = r.get("full_address", "")
+
+                sqft = r.get("Avg_SqFt", None)
+                total_rent = r.get("Total_Rent", None)
+                rent_per_sqft = None
+                if sqft not in [None, 0, np.nan] and total_rent not in [None, np.nan]:
+                    rent_per_sqft = total_rent / sqft
+
+                score = r.get("fit_score", None)
+                if score_min is not None and score is not None and not pd.isna(score):
+                    radius = 6 + max(0, (score - score_min) / score_range * 10)
+                else:
+                    radius = 6
+
+                rent_text = f"${rent_per_sqft:.2f} / sqft / mo" if rent_per_sqft is not None else "N/A"
+                sqft_text = f"{int(sqft)}" if sqft is not None and not pd.isna(sqft) else "N/A"
+                score_text = f"{score:.2f}" if score is not None and not pd.isna(score) else "N/A"
+
+                popup_html = (
+                    f"<b>{name}</b><br>{address}"
+                    f"<br>Fit score: {score_text}"
+                    f"<br>Est. rent per sqft: {rent_text}"
+                    f"<br>Size: {sqft_text} sqft"
+                )
+
+                folium.CircleMarker(
+                    location=[float(lat), float(lon)],
+                    radius=radius,
+                    color=None,
+                    fill=True,
+                    fill_color="#2e7cff",
+                    fill_opacity=0.9,
+                    popup=folium.Popup(popup_html, max_width=300),
+                ).add_to(fmap)
+
+            try:
+                bounds = df[[lat_col, lon_col]].dropna().values.tolist()
+                if bounds:
+                    fmap.fit_bounds(bounds, padding=(30, 30))
+            except Exception:
+                pass
+
+            return fmap
+
+        with map_col:
+            if _FOLIUM_OK:
+                missing_latlon = not any(c in final_merged_df_sorted.columns for c in ["lat", "latitude", "Lat", "Latitude"]) \
+                                 or not any(c in final_merged_df_sorted.columns for c in ["lon", "lng", "longitude", "Longitude", "Lon"])
+                if missing_latlon:
+                    st.info(
+                        "Map is shown without markers because the data does not contain latitude/longitude "
+                        "columns yet. Once you add coordinates (e.g., 'lat' and 'lon'), markers will appear here."
+                    )
+                    fmap = folium.Map(location=(36.7783, -119.4179), zoom_start=6, tiles="OpenStreetMap")
+                else:
+                    fmap = render_map_from_results(final_merged_df_sorted)
+
+                st_folium(fmap, width=900, height=650)
+            else:
+                st.error("To view the map, please install `folium` and `streamlit-folium`: `pip install folium streamlit-folium`")
+
+        # ------------------ TEXT RESULTS ------------------ #
+        with results_col:
+            top_n = final_merged_df_sorted.head(10).copy()
+            restaurant_col = inputs["Restaurant_type_input"]
+
+            for i, row in top_n.iterrows():
+                st.markdown(f"### {i+1}. {row['Name']}")
+                st.markdown(f"- **Address:** {row['full_address']}")
+                st.markdown(f"- **Details:** {row.get('details', '')}")
+                st.markdown(f"- **Overall Fit Score:** `{row['fit_score']:,.2f}`")
+                st.markdown(f"- **Average Total Monthly Rent:** `${row['Price']}`")
+                st.markdown(f"- **Average Total Square Feet:** `{row['Avg_SqFt']}`")
+                st.markdown(f"- **Percentage Asian in County:** `{row['Percentage_Asian']:,.2f}%`")
+                st.markdown(f"- **Median Personal Total Income in County:** `${row['Median_INCTOT']:,.0f}`")
+                st.markdown(f"- **Median Population in County:** `{row['Median_Yearly_Population']:,.0f}`")
+                st.markdown(f"- **Median Price of other restaurants in ZIP:** `${row['Median_price_mid']:,.2f}`")
+                st.markdown(f"- **Total other restaurants in ZIP:** `{row['Count_total_restaurant']}`")
+
+                if restaurant_col in row.index:
+                    st.markdown(f"- **Total other {restaurant_col} restaurants in ZIP:** `{row[restaurant_col]}`")
+
+                st.markdown("---")
+
+        st.subheader("Detailed Table (Top 50)")
+        show_cols = [
+            "Name",
+            "full_address",
+            "fit_score",
+            "Price",
+            "Avg_SqFt",
+            "Percentage_Asian",
+            "Median_INCTOT",
+            "Median_Yearly_Population",
+            "Median_price_mid",
+            "Count_total_restaurant",
+        ]
+        if restaurant_col not in show_cols and restaurant_col in final_merged_df_sorted.columns:
+            show_cols.append(restaurant_col)
+
+        st.dataframe(
+            final_merged_df_sorted.head(50)[[c for c in show_cols if c in final_merged_df_sorted.columns]],
+            use_container_width=True,
+        )
+
+        csv = final_merged_df_sorted.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download all scored locations (CSV)",
+            csv,
+            file_name="scored_restaurant_sites.csv",
+        )
