@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import html
 import folium
 import DataPipeline
 import dictionaries
@@ -50,7 +51,7 @@ div[data-testid="column"] div[data-testid="stVerticalBlock"] > div:first-child {
     margin: 0 !important;
 }
 
-/* Left = sticky map */
+/* Left column sticky */
 .sticky-map {
     position: sticky;
     top: 0;
@@ -58,12 +59,14 @@ div[data-testid="column"] div[data-testid="stVerticalBlock"] > div:first-child {
     overflow: hidden;
 }
 
-/* Right = scroll panel */
+/* Right column scroll area */
 .scroll-panel {
     height: calc(100vh - 110px);
     overflow-y: auto;
     padding-right: 12px;
+    margin-top: 0 !important;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -442,18 +445,32 @@ with left_col:
 # -------------------------
 # RIGHT: SCROLLABLE RESULTS
 # -------------------------
+# -------------------------
+# RIGHT: SCROLLABLE RESULTS
+# -------------------------
 with right_col:
-    st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
-    st.markdown('<div class="scrollable-panel">', unsafe_allow_html=True)
+    st.markdown('<div class="scroll-panel">', unsafe_allow_html=True)
 
-    st.markdown("## 📍 Best Matches")
+    st.markdown("## ⭐ Best Matches")
 
     top_n = final_merged_df_sorted.head(10)
+    
+    # --- Pretty maps from old code ---
+    pretty_income = {"low": "affordable", "medium": "standard priced", "high": "high-cost"}
+    pretty_population = {"low": "Small", "medium": "Medium", "high": "Big"}
+    pretty_asian = {"low": "Low", "medium": "Medium", "high": "High"}
+
+    income_pref = inputs["Median_INCTOT_input"]
+    pop_pref = inputs["Median_Yearly_Population_input"]
+    asian_pref = inputs["Percentage_Asian_input"]
 
     for idx, (_, row) in enumerate(top_n.iterrows()):
+
         best_tag = "<span class='best-tag'>BEST</span>" if idx == 0 else ""
+
         price = "$" + str(row["Price"]).lstrip("$")
 
+        # --- SqFt logic ---
         min_sqft = row.get("Min_SqFt", row["Avg_SqFt"])
         max_sqft = row.get("Max_SqFt", row["Avg_SqFt"])
         sqft_text = (
@@ -462,15 +479,40 @@ with right_col:
             else f"{int(min_sqft):,}–{int(max_sqft):,} SF"
         )
 
+        # --- DEMO LINES (restored from old code) ---
+        demo_lines = []
+
+        # Line 1 – Menu type
+        if row.get("Dummy_Median_INCTOT", 0) == 100:
+            demo_lines.append(
+                f"Good for {pretty_income[income_pref]} menus"
+            )
+
+        # Line 2 – Market + Asian concentration
+        if row.get("Dummy_Median_Yearly_Population", 0) == 100:
+            pop_line = f"{pretty_population[pop_pref]} market"
+
+            if row.get("Dummy_Percentage_Asian", 0) == 100:
+                pop_line += (
+                    f" with {pretty_asian[asian_pref]} Asian population concentration"
+                )
+
+            demo_lines.append(pop_line)
+
+        # Convert to HTML
+        demo_html = "<br>".join(
+            [f"<span style='opacity:0.6;'>{line}</span>" for line in demo_lines]
+        )
+
+        # --- RENDER CARD ---
         st.markdown(f"""
             <div class="result-card" id="card-{row['marker_id']}">
                 <h4>🍜 {row['Name']} {best_tag}</h4>
                 <p><strong>🏷️ {price} • {sqft_text}</strong></p>
                 <p>📍 {row['full_address']}</p>
+                {demo_html}
             </div>
         """, unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # -------------------------
 # HOVER SYNC JS
