@@ -80,6 +80,8 @@ def data_cleaning():
             'state': 'state',
             'zip': 'zip',
             'COUNTY': 'County',
+            'Min_SqFt': 'Min_SqFt',
+            'Max_SqFt': 'Max_SqFt',
             'Avg_SqFt': 'Avg_SqFt',
             'monthly_Rate': 'monthly_Rate',
             'Total_Rent':  'Total_Rent'
@@ -265,9 +267,9 @@ def merge_all_levels(county_stats_df, zip_stats_df, site_level_df):
 
 def calculate_final_scores(weights, inputs):
     # Demo Weights (add up to 1)
-    Percentage_Asian_Weight = 0.45  
-    Median_Yearly_Population_Weight = 0.35  
-    Median_INCTOT_Weight = 0.20
+    Percentage_Asian_Weight = 0.30
+    Median_Yearly_Population_Weight = 0.40
+    Median_INCTOT_Weight = 0.30
 
     # Comp Weights (add up to 1)
     Count_total_target_restaurant_Weight = 0.50  
@@ -275,8 +277,8 @@ def calculate_final_scores(weights, inputs):
     Median_price_mid_Weight = 0.20
 
     # Site Weights (add up to 1)
-    Total_Rent_Weight = 0.60  
-    Avg_SqFt_Weight = 0.40
+    Total_Rent_Weight = 0.50  
+    Avg_SqFt_Weight = 0.50
     # has_parking_Weight =
 
     site_level_df, county_level_df, zip_level_df = data_cleaning()

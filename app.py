@@ -4,11 +4,69 @@ import numpy as np
 import folium
 import DataPipeline
 import dictionaries
+import time
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+
+def escape_dollars(text):
+    if isinstance(text, str):
+        return text.replace("$", "\\$")
+    return text
+
+
+GEOCODE_CACHE_PATH = "geocode_cache.csv"
+
 
 st.set_page_config(
     page_title="Restaurant Site Selector",
     layout="wide"
 )
+
+st.markdown("""
+<style>
+/* Collapse the ghost vertical padding block created after rerun */
+div[data-testid="stVerticalBlock"] > div:nth-child(1) {
+    height: 0 !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Remove Streamlit auto-padding ABOVE BOTH columns */
+div[data-testid="column"] > div:first-child {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+
+/* Remove internal vertical-blocks that push results downward */
+div[data-testid="column"] div[data-testid="stVerticalBlock"] > div:first-child {
+    height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+/* Left = sticky map */
+.sticky-map {
+    position: sticky;
+    top: 0;
+    height: calc(100vh - 110px);
+    overflow: hidden;
+}
+
+/* Right = scroll panel */
+.scroll-panel {
+    height: calc(100vh - 110px);
+    overflow-y: auto;
+    padding-right: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 try:
     import folium
@@ -17,25 +75,93 @@ try:
 except Exception:
     _FOLIUM_OK = False
 
-# -------------------------
-# 1) Load data needed for input ranges
-# -------------------------
+
+# =============================
+#     GEOCODING HELPERS
+# =============================
+
+def _make_geolocator(user_agent="resloc_app"):
+    return Nominatim(user_agent=user_agent, timeout=10)
+
+
+def geocode_addresses(
+    df,
+    address_col="full_address",
+    cache_path=GEOCODE_CACHE_PATH,
+    user_agent="resloc_app",
+    show_progress=True,
+):
+    try:
+        cache = pd.read_csv(cache_path, dtype=str).set_index("address")
+    except Exception:
+        cache = pd.DataFrame(columns=["address", "lat", "lon"]).set_index("address")
+
+    geolocator = _make_geolocator(user_agent=user_agent)
+    geocode_limited = RateLimiter(
+        geolocator.geocode,
+        min_delay_seconds=1,
+        max_retries=2,
+        error_wait_seconds=2.0,
+    )
+
+    addresses = df[address_col].astype(str).fillna("").unique().tolist()
+    to_query = [a for a in addresses if a not in cache.index]
+
+    total = len(to_query)
+    progress_bar = st.progress(0.0) if (show_progress and total > 0) else None
+
+    for i, addr in enumerate(to_query, start=1):
+        try:
+            res = geocode_limited(addr)
+            if res:
+                lat, lon = float(res.latitude), float(res.longitude)
+            else:
+                lat, lon = None, None
+        except Exception:
+            lat, lon = None, None
+
+        cache.loc[addr] = {"lat": lat, "lon": lon}
+
+        if progress_bar:
+            progress_bar.progress(i / max(1, total))
+
+    try:
+        cache.reset_index().to_csv(cache_path, index=False)
+    except Exception:
+        pass
+
+    merged = df.copy()
+    merged["address"] = merged[address_col].astype(str)
+    merged = merged.merge(
+        cache.reset_index(), how="left", left_on="address", right_on="address"
+    )
+    merged["lat"] = pd.to_numeric(merged["lat"], errors="coerce")
+    merged["lon"] = pd.to_numeric(merged["lon"], errors="coerce")
+
+    return merged
+
+
+# =============================
+# 1) LOAD BASE DATA
+# =============================
 
 @st.cache_data
 def get_site_level_df():
     site_level_df, _, _ = DataPipeline.data_cleaning()
     return site_level_df
 
+
 site_level_df = get_site_level_df()
 Avg_SqFt_range = site_level_df["Avg_SqFt"].agg(["min", "max"])
 
-# -------------------------
-# 2) Sidebar – user inputs
-# -------------------------
+
+# =============================
+# 2) SIDEBAR INPUTS
+# =============================
 
 st.sidebar.title("Your Restaurant Preferences")
 
-# ---- Top-level weights (Demo / Comp / Site) ----
+# ---- Weights ---- #
 st.sidebar.subheader("Step 1 – What matters most?")
 
 demo_raw = st.sidebar.slider("Demographics importance", 0.0, 1.0, 0.4, 0.05)
@@ -45,19 +171,12 @@ site_raw = st.sidebar.slider("Site (rent & size) importance", 0.0, 1.0, 0.2, 0.0
 total_raw = demo_raw + comp_raw + site_raw
 if total_raw == 0:
     Demo_weight = 0.4
-    Comp_weight = 0.4
-    Site_weight = 0.2
+    Comp_weight = 0.25
+    Site_weight = 0.35
 else:
     Demo_weight = demo_raw / total_raw
     Comp_weight = comp_raw / total_raw
     Site_weight = site_raw / total_raw
-
-st.sidebar.markdown(
-    f"**Normalized weights**  \n"
-    f"- Demographic: `{Demo_weight:.2f}`  \n"
-    f"- Competition: `{Comp_weight:.2f}`  \n"
-    f"- Site: `{Site_weight:.2f}`"
-)
 
 weights = {
     "Demo_weight": Demo_weight,
@@ -65,7 +184,7 @@ weights = {
     "Site_weight": Site_weight,
 }
 
-# ---- Restaurant Type (Cuisine) ----
+# ---- Cuisine ---- #
 st.sidebar.subheader("Step 2 – Restaurant type")
 
 Restaurant_Types = list(dictionaries.asian_food_keywords.keys())
@@ -75,7 +194,7 @@ Restaurant_type_input = st.sidebar.selectbox(
     index=Restaurant_Types.index("Vietnamese") if "Vietnamese" in Restaurant_Types else 0,
 )
 
-# ---- Site preference: Size ----
+# ---- Site Size ---- #
 st.sidebar.subheader("Step 3 – Site size preference")
 
 min_sqft = int(Avg_SqFt_range["min"])
@@ -90,32 +209,19 @@ Avg_SqFt_input = st.sidebar.slider(
     step=50,
 )
 
-# ---- Demographic preferences (Low / Medium / High) ----
+# ---- Demographics ---- #
 st.sidebar.subheader("Step 4 – Area demographics")
 
-Percentage_Asian_Options = ["Low", "Medium", "High"]
-Median_INCTOT_Options = ["Low", "Medium", "High"]
-Median_Yearly_Population_Options = ["Low", "Medium", "High"]
-
 Percentage_Asian_choice = st.sidebar.selectbox(
-    "Market saturation (Asian population share)",
-    options=Percentage_Asian_Options,
-    index=2,  # default: High
+    "Market saturation (Asian population share)", ["Low", "Medium", "High"], index=2
 )
-
 Median_INCTOT_choice = st.sidebar.selectbox(
-    "Typical income level (customer spending power)",
-    options=Median_INCTOT_Options,
-    index=1,  # default: Medium
+    "Typical income level", ["Low", "Medium", "High"], index=1
 )
-
 Median_Yearly_Population_choice = st.sidebar.selectbox(
-    "Location type (population size)",
-    options=Median_Yearly_Population_Options,
-    index=1,  # default: Medium
+    "Location type (population size)", ["Low", "Medium", "High"], index=1
 )
 
-# Map display labels to the lowercase strings expected by DataPipeline.scaling()
 inputs = {
     "Restaurant_type_input": Restaurant_type_input,
     "Avg_SqFt_input": Avg_SqFt_input,
@@ -124,178 +230,283 @@ inputs = {
     "Median_Yearly_Population_input": Median_Yearly_Population_choice.lower(),
 }
 
-# -------------------------
-# 3) Main page – run scoring
-# -------------------------
+
+# =============================
+# 3) MAIN LOGIC + GEOCODING
+# =============================
 
 st.title("Restaurant Site Selector")
-st.write(
-    "This tool helps you compare available restaurant sites in California based on "
-    "demographics, competition, and site characteristics tailored to your Asian restaurant."
-)
+st.write("We help you find the best rental locations in California for your new Asian restaurant!")
 
 run_button = st.button("Find Best Locations")
 
-# Initialize session_state to hold results
 if "final_results" not in st.session_state:
     st.session_state["final_results"] = None
 
-# When button is clicked: compute and store results
 if run_button:
-    with st.spinner("Calculating the best sites for your restaurant..."):
-        st.session_state["final_results"] = DataPipeline.calculate_final_scores(weights, inputs)
+    with st.spinner("Finding best sites based on your preferences…"):
+        results = DataPipeline.calculate_final_scores(weights, inputs)
 
-# Always read from session_state
+        if results is not None and not results.empty:
+            top50 = results.head(50).copy()
+            geo_top50 = geocode_addresses(
+                top50, address_col="full_address", show_progress=True
+            )
+
+            results_geo = results.merge(
+                geo_top50[["full_address", "lat", "lon"]],
+                on="full_address",
+                how="left",
+            )
+
+            st.session_state["final_results"] = results_geo
+        else:
+            st.session_state["final_results"] = results
+
 final_merged_df_sorted = st.session_state["final_results"]
 
 if final_merged_df_sorted is None:
-    st.info("Set your preferences in the sidebar, then click **Find Best Locations** to see suggested sites.")
-else:
-    if final_merged_df_sorted.empty:
-        st.warning("No sites matched the current filters. Try adjusting your preferences.")
-    else:
-        st.subheader("Top 10 Recommended Locations")
+    st.info("Set your preferences then click 'Find Best Locations'.")
+    st.stop()
 
-        map_col, results_col = st.columns([3, 2])
+if final_merged_df_sorted.empty:
+    st.warning("No sites matched. Try adjusting filters.")
+    st.stop()
 
-        # ------------------ MAP ------------------ #
-        def render_map_from_results(df, center=(36.7783, -119.4179), zoom_start=6):
-            fmap = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap")
-            if df is None or df.empty:
-                return fmap
+# =============================
+# 4) FIXED MAP + SCROLLABLE RESULTS LAYOUT
+# =============================
 
-            possible_lat_cols = ["lat", "latitude", "Lat", "Latitude"]
-            possible_lon_cols = ["lon", "lng", "longitude", "Longitude", "Lon"]
+# =============================
+# MAP RENDER FUNCTION
+# =============================
+def render_map_from_results(df, center=(36.7783, -119.4179), zoom_start=6):
+    fmap = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap")
 
-            lat_col = next((c for c in possible_lat_cols if c in df.columns), None)
-            lon_col = next((c for c in possible_lon_cols if c in df.columns), None)
+    lat_col = next((c for c in ["lat", "Lat", "latitude"] if c in df.columns), None)
+    lon_col = next((c for c in ["lon", "Lon", "lng", "longitude"] if c in df.columns), None)
 
-            if lat_col is None or lon_col is None:
-                return fmap
+    if lat_col is None or lon_col is None:
+        return fmap
 
-            if "fit_score" in df.columns:
-                score_min = df["fit_score"].min()
-                score_max = df["fit_score"].max()
-                score_range = max(score_max - score_min, 1e-6)
-            else:
-                score_min = score_max = None
-                score_range = 1.0
+    score_min = df["fit_score"].min()
+    score_max = df["fit_score"].max()
+    score_range = max(score_max - score_min, 1e-6)
 
-            for _, r in df.iterrows():
-                lat = r.get(lat_col)
-                lon = r.get(lon_col)
-                if pd.isna(lat) or pd.isna(lon):
-                    continue
+    for _, r in df.iterrows():
+        if pd.isna(r[lat_col]) or pd.isna(r[lon_col]):
+            continue
 
-                name = r.get("Name", "Candidate")
-                address = r.get("full_address", "")
+        marker_id = int(r["marker_id"])
 
-                sqft = r.get("Avg_SqFt", None)
-                total_rent = r.get("Total_Rent", None)
-                rent_per_sqft = None
-                if sqft not in [None, 0, np.nan] and total_rent not in [None, np.nan]:
-                    rent_per_sqft = total_rent / sqft
+        radius = 6 + max(0, (r["fit_score"] - score_min) / score_range * 10)
 
-                score = r.get("fit_score", None)
-                if score_min is not None and score is not None and not pd.isna(score):
-                    radius = 6 + max(0, (score - score_min) / score_range * 10)
-                else:
-                    radius = 6
-
-                rent_text = f"${rent_per_sqft:.2f} / sqft / mo" if rent_per_sqft is not None else "N/A"
-                sqft_text = f"{int(sqft)}" if sqft is not None and not pd.isna(sqft) else "N/A"
-                score_text = f"{score:.2f}" if score is not None and not pd.isna(score) else "N/A"
-
-                popup_html = (
-                    f"<b>{name}</b><br>{address}"
-                    f"<br>Fit score: {score_text}"
-                    f"<br>Est. rent per sqft: {rent_text}"
-                    f"<br>Size: {sqft_text} sqft"
-                )
-
-                folium.CircleMarker(
-                    location=[float(lat), float(lon)],
-                    radius=radius,
-                    color=None,
-                    fill=True,
-                    fill_color="#2e7cff",
-                    fill_opacity=0.9,
-                    popup=folium.Popup(popup_html, max_width=300),
-                ).add_to(fmap)
-
-            try:
-                bounds = df[[lat_col, lon_col]].dropna().values.tolist()
-                if bounds:
-                    fmap.fit_bounds(bounds, padding=(30, 30))
-            except Exception:
-                pass
-
-            return fmap
-
-        with map_col:
-            if _FOLIUM_OK:
-                missing_latlon = not any(c in final_merged_df_sorted.columns for c in ["lat", "latitude", "Lat", "Latitude"]) \
-                                 or not any(c in final_merged_df_sorted.columns for c in ["lon", "lng", "longitude", "Longitude", "Lon"])
-                if missing_latlon:
-                    st.info(
-                        "Map is shown without markers because the data does not contain latitude/longitude "
-                        "columns yet. Once you add coordinates (e.g., 'lat' and 'lon'), markers will appear here."
-                    )
-                    fmap = folium.Map(location=(36.7783, -119.4179), zoom_start=6, tiles="OpenStreetMap")
-                else:
-                    fmap = render_map_from_results(final_merged_df_sorted)
-
-                st_folium(fmap, width=900, height=650)
-            else:
-                st.error("To view the map, please install `folium` and `streamlit-folium`: `pip install folium streamlit-folium`")
-
-        # ------------------ TEXT RESULTS ------------------ #
-        with results_col:
-            top_n = final_merged_df_sorted.head(10).copy()
-            restaurant_col = inputs["Restaurant_type_input"]
-
-            for i, row in top_n.iterrows():
-                st.markdown(f"### {i+1}. {row['Name']}")
-                st.markdown(f"- **Address:** {row['full_address']}")
-                st.markdown(f"- **Details:** {row.get('details', '')}")
-                st.markdown(f"- **Overall Fit Score:** `{row['fit_score']:,.2f}`")
-                st.markdown(f"- **Average Total Monthly Rent:** `${row['Price']}`")
-                st.markdown(f"- **Average Total Square Feet:** `{row['Avg_SqFt']}`")
-                st.markdown(f"- **Percentage Asian in County:** `{row['Percentage_Asian']:,.2f}%`")
-                st.markdown(f"- **Median Personal Total Income in County:** `${row['Median_INCTOT']:,.0f}`")
-                st.markdown(f"- **Median Population in County:** `{row['Median_Yearly_Population']:,.0f}`")
-                st.markdown(f"- **Median Price of other restaurants in ZIP:** `${row['Median_price_mid']:,.2f}`")
-                st.markdown(f"- **Total other restaurants in ZIP:** `{row['Count_total_restaurant']}`")
-
-                if restaurant_col in row.index:
-                    st.markdown(f"- **Total other {restaurant_col} restaurants in ZIP:** `{row[restaurant_col]}`")
-
-                st.markdown("---")
-
-        st.subheader("Detailed Table (Top 50)")
-        show_cols = [
-            "Name",
-            "full_address",
-            "fit_score",
-            "Price",
-            "Avg_SqFt",
-            "Percentage_Asian",
-            "Median_INCTOT",
-            "Median_Yearly_Population",
-            "Median_price_mid",
-            "Count_total_restaurant",
-        ]
-        if restaurant_col not in show_cols and restaurant_col in final_merged_df_sorted.columns:
-            show_cols.append(restaurant_col)
-
-        st.dataframe(
-            final_merged_df_sorted.head(50)[[c for c in show_cols if c in final_merged_df_sorted.columns]],
-            use_container_width=True,
+        marker = folium.CircleMarker(
+            location=[float(r[lat_col]), float(r[lon_col])],
+            radius=radius,
+            color="#2e7cff",
+            fill=True,
+            fill_color="#2e7cff",
+            fill_opacity=0.9
         )
 
-        csv = final_merged_df_sorted.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download all scored locations (CSV)",
-            csv,
-            file_name="scored_restaurant_sites.csv",
+        marker.add_to(fmap)
+
+        # Expose markers to JS
+        marker.get_root().html.add_child(folium.Element(f"""
+            <script>
+                if (window.markerMap === undefined) {{
+                    window.markerMap = {{}};
+                }}
+                window.markerMap["marker-{marker_id}"] = {{
+                    marker: document.getElementsByClassName('leaflet-interactive')[document.getElementsByClassName('leaflet-interactive').length-1]
+                }};
+            </script>
+        """))
+
+    try:
+        fmap.fit_bounds(df[[lat_col, lon_col]].dropna().values.tolist(), padding=(30,30))
+    except:
+        pass
+
+    return fmap
+
+# ---- Custom CSS layout ----
+st.markdown("""
+<style>
+    .gmaps-container {
+        display: flex;
+        height: calc(100vh - 150px);  /* full height minus top Streamlit header */
+        width: 100%;
+        overflow: hidden;
+        margin-top: 10px;
+    }
+
+    .map-panel {
+        flex: 3;
+        height: 100%;
+        position: sticky;
+        top: 0;
+        overflow: hidden;
+    }
+
+    .results-panel {
+        flex: 2;
+        height: 100%;
+        overflow-y: scroll;
+        padding: 10px 18px;
+        background-color: #111;
+        color: white;
+    }
+
+    /* --- Cards --- */
+    .result-card {
+        background: #1e1e1e;
+        border-radius: 14px;
+        padding: 18px;
+        margin-bottom: 16px;
+        border: 1px solid #333;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.55);
+        transition: .2s;
+    }
+    .result-card:hover {
+        transform: translateY(-3px);
+        border-color: #4e8cff;
+        background: #272727;
+    }
+    .best-tag {
+        background: #2e7cff;
+        color: #fff;
+        padding: 3px 7px;
+        font-size: 11px;
+        border-radius: 6px;
+        margin-left: 6px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# 5) FIXED MAP + SCROLLABLE RESULTS USING STREAMLIT COLUMNS
+# =========================================================
+
+# Assign unique IDs
+final_merged_df_sorted = final_merged_df_sorted.copy()
+final_merged_df_sorted["marker_id"] = range(1, len(final_merged_df_sorted) + 1)
+
+# Build map
+fmap = render_map_from_results(final_merged_df_sorted)
+
+# Create two columns: LEFT map, RIGHT cards
+left_col, right_col = st.columns([3, 2], gap="small")
+
+# Force both columns to align from very top
+st.markdown("""
+<style>
+/* Reset Streamlit padding/margins that push content downward */
+section.main > div {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+}
+
+/* Column padding fix */
+div[data-testid="column"] > div:nth-child(1) {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+}
+
+/* Make BOTH column wrappers sticky at top */
+.sticky-col {
+    position: sticky;
+    top: 0;
+    height: calc(100vh - 120px);
+    overflow: hidden;
+}
+
+/* Scrollable right column */
+.scrollable-panel {
+    height: calc(100vh - 120px);
+    overflow-y: auto;
+    padding-right: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------
+# LEFT: MAP (fixed height)
+# -------------------------
+with left_col:
+    st.markdown('<div class="sticky-map">', unsafe_allow_html=True)
+    st_folium(fmap, height=750, width=None)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------------
+# RIGHT: SCROLLABLE RESULTS
+# -------------------------
+with right_col:
+    st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+    st.markdown('<div class="scrollable-panel">', unsafe_allow_html=True)
+
+    st.markdown("## 📍 Best Matches")
+
+    top_n = final_merged_df_sorted.head(10)
+
+    for idx, (_, row) in enumerate(top_n.iterrows()):
+        best_tag = "<span class='best-tag'>BEST</span>" if idx == 0 else ""
+        price = "$" + str(row["Price"]).lstrip("$")
+
+        min_sqft = row.get("Min_SqFt", row["Avg_SqFt"])
+        max_sqft = row.get("Max_SqFt", row["Avg_SqFt"])
+        sqft_text = (
+            f"{int(min_sqft):,} SF"
+            if int(min_sqft) == int(max_sqft)
+            else f"{int(min_sqft):,}–{int(max_sqft):,} SF"
         )
+
+        st.markdown(f"""
+            <div class="result-card" id="card-{row['marker_id']}">
+                <h4>🍜 {row['Name']} {best_tag}</h4>
+                <p><strong>🏷️ {price} • {sqft_text}</strong></p>
+                <p>📍 {row['full_address']}</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------------
+# HOVER SYNC JS
+# -------------------------
+st.markdown("""
+<script>
+function highlight(id){
+    const el = window.markerMap?.["marker-"+id]?.marker;
+    if(!el) return;
+    el.style.stroke = "yellow";
+    el.style.strokeWidth = "4px";
+}
+function reset(id){
+    const el = window.markerMap?.["marker-"+id]?.marker;
+    if(!el) return;
+    el.style.stroke = "";
+    el.style.strokeWidth = "";
+}
+
+setTimeout(() => {
+    document.querySelectorAll("[id^='card-']").forEach(card => {
+        const id = card.id.replace("card-", "");
+        card.onmouseenter = () => highlight(id);
+        card.onmouseleave = () => reset(id);
+    });
+}, 1000);
+</script>
+""", unsafe_allow_html=True)
+
+
+# =============================
+# 6) TABLE + DOWNLOAD
+# =============================
+
+st.subheader("Detailed Table (Top 50)")
+st.dataframe(final_merged_df_sorted.head(50), use_container_width=True)
+
+csv = final_merged_df_sorted.to_csv(index=False).encode("utf-8")
+st.download_button("Download CSV", csv, "scored_sites.csv")
