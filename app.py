@@ -149,37 +149,59 @@ def geocode_addresses(
 # =============================
 
 @st.cache_data
-def get_site_level_df():
-    site_level_df, _, _ = DataPipeline.data_cleaning()
-    return site_level_df
-
-
-site_level_df = get_site_level_df()
+def load_data():
+    site_level_df, county_level_df, zip_level_df = DataPipeline.data_cleaning()
+    return site_level_df, county_level_df, zip_level_df
+site_level_df, county_level_df, zip_level_df = load_data()
 Avg_SqFt_range = site_level_df["Avg_SqFt"].agg(["min", "max"])
 
 
 # =============================
-# 2) SIDEBAR INPUTS
+# 2) SIDEBAR INPUTS (PREMIUM UI)
 # =============================
 
-st.sidebar.title("Your Restaurant Preferences")
+st.sidebar.title("🍽️ Your Restaurant Preferences")
 
-# ---- Weights ---- #
-st.sidebar.subheader("Step 1 – What matters most?")
+# ============================================================
+# STEP 1 — WEIGHTS / IMPORTANCE
+# ============================================================
 
-demo_raw = st.sidebar.slider("Demographics importance", 0.0, 1.0, 0.4, 0.05)
-comp_raw = st.sidebar.slider("Competition importance", 0.0, 1.0, 0.4, 0.05)
-site_raw = st.sidebar.slider("Site (rent & size) importance", 0.0, 1.0, 0.2, 0.05)
+st.sidebar.subheader("⭐ Step 1 – What matters most to you?")
 
-total_raw = demo_raw + comp_raw + site_raw
-if total_raw == 0:
+st.sidebar.markdown(
+    "<small>Move each slider to tell us what YOU care about the most.</small>",
+    unsafe_allow_html=True
+)
+
+# Cute icons + sliders
+demo_pct = st.sidebar.slider(
+    "👨‍👩‍👧‍👦 How important are your future customers?",
+    min_value=0, max_value=100, value=40, step=1,
+    help="This includes things like income level, area population, and Asian population share."
+)
+
+comp_pct = st.sidebar.slider(
+    "⚔️ How important is avoiding competition?",
+    min_value=0, max_value=100, value=40, step=1,
+    help="How much you care about being far from similar restaurants."
+)
+
+site_pct = st.sidebar.slider(
+    "🏠 How important is the rental space itself?",
+    min_value=0, max_value=100, value=20, step=1,
+    help="Size of the restaurant, rental price, and building characteristics."
+)
+
+# Convert % to weights
+total_pct = demo_pct + comp_pct + site_pct
+if total_pct == 0:
     Demo_weight = 0.4
     Comp_weight = 0.25
     Site_weight = 0.35
 else:
-    Demo_weight = demo_raw / total_raw
-    Comp_weight = comp_raw / total_raw
-    Site_weight = site_raw / total_raw
+    Demo_weight = demo_pct / total_pct
+    Comp_weight = comp_pct / total_pct
+    Site_weight = site_pct / total_pct
 
 weights = {
     "Demo_weight": Demo_weight,
@@ -187,52 +209,126 @@ weights = {
     "Site_weight": Site_weight,
 }
 
-# ---- Cuisine ---- #
-st.sidebar.subheader("Step 2 – Restaurant type")
+# ============================================================
+# STEP 2 – RESTAURANT TYPE
+# ============================================================
 
-Restaurant_Types = list(dictionaries.asian_food_keywords.keys())
-Restaurant_type_input = st.sidebar.selectbox(
-    "Cuisine (type of Asian restaurant)",
-    options=Restaurant_Types,
-    index=Restaurant_Types.index("Vietnamese") if "Vietnamese" in Restaurant_Types else 0,
+st.sidebar.subheader("🍜 Step 2 – About Your Restaurant")
+
+st.sidebar.markdown(
+    "<small>Help us understand what type of restaurant you want to open.</small>",
+    unsafe_allow_html=True
 )
 
-# ---- Site Size ---- #
-st.sidebar.subheader("Step 3 – Site size preference")
+Restaurant_Types = list(dictionaries.asian_food_keywords.keys())
 
-min_sqft = int(Avg_SqFt_range["min"])
-max_sqft = int(Avg_SqFt_range["max"])
-default_sqft = int((min_sqft + max_sqft) / 2)
+Restaurant_type_input = st.sidebar.selectbox(
+    "🍱 What type of Asian cuisine will you serve?",
+    options=Restaurant_Types,
+    index=Restaurant_Types.index("Vietnamese") if "Vietnamese" in Restaurant_Types else 0,
+    help="We'll look for places with fewer restaurants similar to yours."
+)
+
+# ============================================================
+# STEP 3 – IDEAL RESTAURANT SIZE
+# ============================================================
+
+# IQR-based range
+min_sqft = int(site_level_df["Avg_SqFt"].quantile(0.1))
+max_sqft = int(site_level_df["Avg_SqFt"].quantile(0.9))
+default_sqft = int(site_level_df["Avg_SqFt"].median())
+
+def sqft_label(val):
+    if val < 1600:
+        return "🧋 Small shop — like a boba tea store"
+    elif val > 3200:
+        return "🍽️ Large restaurant — great for fine dining"
+    else:
+        return "🍜 Mid-size — perfect for casual dine-in"
 
 Avg_SqFt_input = st.sidebar.slider(
-    "Preferred average square feet",
+    "📐 Preferred restaurant size (sq ft)",
     min_value=min_sqft,
     max_value=max_sqft,
     value=default_sqft,
-    step=50,
+    step=1,
+    help="Slide to choose how big your restaurant should be."
 )
 
-# ---- Demographics ---- #
-st.sidebar.subheader("Step 4 – Area demographics")
+st.sidebar.caption(f"**{sqft_label(Avg_SqFt_input)}**")
 
-Percentage_Asian_choice = st.sidebar.selectbox(
-    "Market saturation (Asian population share)", ["Low", "Medium", "High"], index=2
+# ============================================================
+# STEP 4 – MENU PRICING
+# ============================================================
+
+Median_INCTOT_choice_raw = st.sidebar.selectbox(
+    "💵 Menu Price Level",
+    [
+        "Affordable (below $15)",
+        "Average ($15 – $30)",
+        "Costly (above $30)"
+    ],
+    index=1,
+    help="Choose the typical price customers will pay per person."
 )
-Median_INCTOT_choice = st.sidebar.selectbox(
-    "Typical income level", ["Low", "Medium", "High"], index=1
+
+# Convert to lowercase standard
+if "Affordable" in Median_INCTOT_choice_raw:
+    Median_INCTOT_choice = "low"
+elif "Average" in Median_INCTOT_choice_raw:
+    Median_INCTOT_choice = "medium"
+else:
+    Median_INCTOT_choice = "high"
+
+# ============================================================
+# STEP 5 – LOCAL MARKET / DEMOGRAPHICS
+# ============================================================
+
+st.sidebar.subheader("🌎 Step 5 – What kind of area do you prefer?")
+
+# Asian population share
+Percentage_Asian_choice_raw = st.sidebar.selectbox(
+    "🧑‍🍳 Asian Population Share",
+    ["Low", "Medium", "High"],
+    index=2,
+    help="High = More likely customers for Asian restaurants."
 )
-Median_Yearly_Population_choice = st.sidebar.selectbox(
-    "Location type (population size)", ["Low", "Medium", "High"], index=1
+Percentage_Asian_choice = Percentage_Asian_choice_raw.lower()
+
+# Population quantiles
+pop_30 = county_level_df["Median_Yearly_Population"].quantile(0.3)
+pop_70 = county_level_df["Median_Yearly_Population"].quantile(0.7)
+
+Median_Yearly_Population_choice_raw = st.sidebar.selectbox(
+    "🏙️ Population Size",
+    [
+        f"Rural (below {int(pop_30):,} people)",
+        f"Suburb ({int(pop_30):,} – {int(pop_70):,} people)",
+        f"Metropolitan / City (above {int(pop_70):,} people)"
+    ],
+    index=1,
+    help="Choose the type of area you'd like your restaurant to be in."
 )
+
+# Convert for backend
+if "Rural" in Median_Yearly_Population_choice_raw:
+    Median_Yearly_Population_choice = "low"
+elif "Suburb" in Median_Yearly_Population_choice_raw:
+    Median_Yearly_Population_choice = "medium"
+else:
+    Median_Yearly_Population_choice = "high"
+
+# ============================================================
+# FINAL CLEAN MODEL INPUT PACKAGE
+# ============================================================
 
 inputs = {
     "Restaurant_type_input": Restaurant_type_input,
     "Avg_SqFt_input": Avg_SqFt_input,
-    "Percentage_Asian_input": Percentage_Asian_choice.lower(),
-    "Median_INCTOT_input": Median_INCTOT_choice.lower(),
-    "Median_Yearly_Population_input": Median_Yearly_Population_choice.lower(),
+    "Percentage_Asian_input": Percentage_Asian_choice,
+    "Median_INCTOT_input": Median_INCTOT_choice,
+    "Median_Yearly_Population_input": Median_Yearly_Population_choice,
 }
-
 
 # =============================
 # 3) MAIN LOGIC + GEOCODING
@@ -241,12 +337,18 @@ inputs = {
 st.title("Restaurant Site Selector")
 st.write("We help you find the best rental locations in California for your new Asian restaurant!")
 
+# Freeze user inputs so the results don't change before clicking the button
+if "frozen_inputs" not in st.session_state:
+    st.session_state["frozen_inputs"] = None
+
 run_button = st.button("Find Best Locations")
 
 if "final_results" not in st.session_state:
     st.session_state["final_results"] = None
 
 if run_button:
+    # Store current user settings so they don't change until next click
+    st.session_state["frozen_inputs"] = inputs.copy()
     with st.spinner("Finding best sites based on your preferences…"):
         results = DataPipeline.calculate_final_scores(weights, inputs)
 
@@ -453,16 +555,18 @@ with right_col:
 
     st.markdown("## ⭐ Best Matches")
 
-    top_n = final_merged_df_sorted.head(10)
+    top_n = final_merged_df_sorted.head(5)
     
     # --- Pretty maps from old code ---
     pretty_income = {"low": "affordable", "medium": "standard priced", "high": "high-cost"}
     pretty_population = {"low": "Small", "medium": "Medium", "high": "Big"}
     pretty_asian = {"low": "Low", "medium": "Medium", "high": "High"}
 
-    income_pref = inputs["Median_INCTOT_input"]
-    pop_pref = inputs["Median_Yearly_Population_input"]
-    asian_pref = inputs["Percentage_Asian_input"]
+    f_inputs = st.session_state["frozen_inputs"]
+
+    income_pref = f_inputs["Median_INCTOT_input"]
+    pop_pref = f_inputs["Median_Yearly_Population_input"]
+    asian_pref = f_inputs["Percentage_Asian_input"]
 
     for idx, (_, row) in enumerate(top_n.iterrows()):
 
@@ -490,7 +594,7 @@ with right_col:
 
         # Line 2 – Market + Asian concentration
         if row.get("Dummy_Median_Yearly_Population", 0) == 100:
-            pop_line = f"{pretty_population[pop_pref]} market"
+            pop_line = f"{pretty_population[pop_pref]} market size"
 
             if row.get("Dummy_Percentage_Asian", 0) == 100:
                 pop_line += (
@@ -507,7 +611,7 @@ with right_col:
         # --- RENDER CARD ---
         st.markdown(f"""
             <div class="result-card" id="card-{row['marker_id']}">
-                <h4>🍜 {row['Name']} {best_tag}</h4>
+                <h4>{row['Name']} {best_tag}</h4>
                 <p><strong>🏷️ {price} • {sqft_text}</strong></p>
                 <p>📍 {row['full_address']}</p>
                 {demo_html}
@@ -542,13 +646,29 @@ setTimeout(() => {
 </script>
 """, unsafe_allow_html=True)
 
-
 # =============================
 # 6) TABLE + DOWNLOAD
 # =============================
 
-st.subheader("Detailed Table (Top 50)")
-st.dataframe(final_merged_df_sorted.head(50), use_container_width=True)
+st.subheader("Best 50 Locations Summary")
 
-csv = final_merged_df_sorted.to_csv(index=False).encode("utf-8")
+# Build trimmed-down table
+export_df = final_merged_df_sorted.head(50).copy()
+
+# Keep only required columns
+export_df = export_df[["Name", "full_address", "Price", "details"]]
+
+# Rename columns for export
+export_df = export_df.rename(columns={
+    "full_address": "Address",
+    "Price": "Rental Cost",
+    "details": "Description"
+})
+
+# Show table in UI
+st.dataframe(export_df, use_container_width=True)
+
+# Download version
+csv = export_df.to_csv(index=False).encode("utf-8")
 st.download_button("Download CSV", csv, "scored_sites.csv")
+
