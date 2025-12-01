@@ -94,6 +94,7 @@ def geocode_addresses(
     user_agent="resloc_app",
     show_progress=True,
 ):
+    # ---- load cache (if exists) ----
     try:
         cache = pd.read_csv(cache_path, dtype=str).set_index("address")
     except Exception:
@@ -107,12 +108,25 @@ def geocode_addresses(
         error_wait_seconds=2.0,
     )
 
+    # helper: decide if we should geocode an address
+    def needs_geocode(addr: str) -> bool:
+        if addr not in cache.index:
+            return True
+        row = cache.loc[addr]
+        lat = row.get("lat", None)
+        lon = row.get("lon", None)
+        # re-query if missing / empty
+        if pd.isna(lat) or pd.isna(lon) or lat == "" or lon == "":
+            return True
+        return False
+
     addresses = df[address_col].astype(str).fillna("").unique().tolist()
-    to_query = [a for a in addresses if a not in cache.index]
+    to_query = [a for a in addresses if needs_geocode(a)]
 
     total = len(to_query)
     progress_bar = st.progress(0.0) if (show_progress and total > 0) else None
 
+    # ---- geocode missing addresses ----
     for i, addr in enumerate(to_query, start=1):
         try:
             res = geocode_limited(addr)
@@ -128,11 +142,13 @@ def geocode_addresses(
         if progress_bar:
             progress_bar.progress(i / max(1, total))
 
+    # ---- save cache ----
     try:
         cache.reset_index().to_csv(cache_path, index=False)
     except Exception:
         pass
 
+    # ---- merge back onto df ----
     merged = df.copy()
     merged["address"] = merged[address_col].astype(str)
     merged = merged.merge(
@@ -194,21 +210,21 @@ with st.sidebar.expander("⭐ Step 1 — What matters most to you?", expanded=Tr
     )
 
     demo_pct = st.slider(
-        "👨‍👩‍👧‍👦 Importance of your customers",
+        "👨‍👩‍👧‍👦 Customer Proximity",
         0, 100, 40,
-        help="Income, population size, and local Asian community"
+        help="How important is it for your restaurant to be close to your target customers? Higher values prioritize locations with more nearby residents, workers, or foot traffic that matches your customer profile."
     )
 
     comp_pct = st.slider(
-        "⚔️ Importance of avoiding competition",
+        "⚔️ Competition Avoidance",
         0, 100, 40,
-        help="High competition areas might reduce your sales"
+        help="How strongly do you want to stay away from competing restaurants? A higher value increases the priority for areas with fewer similar businesses nearby."
     )
 
     site_pct = st.slider(
-        "🏠 Importance of the rental site",
+        "🏠 Site Quality / Rent Factor",
         0, 100, 20,
-        help="Size, rental cost, location details"
+        help="How much do rental prices influence your decision? A higher value favors locations with lower rent costs, even if customer traffic or visibility is lower."
     )
 
 # Convert % to normalized weights
@@ -386,16 +402,17 @@ if run_button:
     # Store current user settings so they don't change until next click
     st.session_state["frozen_inputs"] = inputs.copy()
     with st.spinner("Finding best sites based on your preferences…"):
-        results = DataPipeline.calculate_final_scores(weights, inputs)
+        # only keep top 10 in the pipeline result
+        results = DataPipeline.calculate_final_scores(weights, inputs, top_n=50)
 
         if results is not None and not results.empty:
-            top50 = results.head(50).copy()
-            geo_top50 = geocode_addresses(
-                top50, address_col="full_address", show_progress=True
+            top10 = results.head(10).copy()
+            geo_top10 = geocode_addresses(
+                top10, address_col="full_address", show_progress=True
             )
 
             results_geo = results.merge(
-                geo_top50[["full_address", "lat", "lon"]],
+                geo_top10[["full_address", "lat", "lon"]],
                 on="full_address",
                 how="left",
             )
@@ -439,16 +456,31 @@ def render_map_from_results(df, center=(36.7783, -119.4179), zoom_start=6):
             continue
 
         marker_id = int(r["marker_id"])
+        rank = int(r.get("rank", 9999))
 
+        # base radius from score
         radius = 6 + max(0, (r["fit_score"] - score_min) / score_range * 10)
+
+        # --- styling based on rank ---
+        if rank == 1:
+            color = "#D3AF37"   # gold
+            radius = radius + 1.5
+        elif rank == 2:
+            color = "#C0C0C0"   # orange
+            radius = radius + 1
+        elif rank == 3:
+            color = "#CD7F32"
+            radius = radius + 0.5
+        else:
+            color = "#2e7cff"   # default blue
 
         marker = folium.CircleMarker(
             location=[float(r[lat_col]), float(r[lon_col])],
             radius=radius,
-            color="#2e7cff",
+            color=color,
             fill=True,
-            fill_color="#2e7cff",
-            fill_opacity=0.9
+            fill_color=color,
+            fill_opacity=0.9,
         )
 
         marker.add_to(fmap)
@@ -466,11 +498,12 @@ def render_map_from_results(df, center=(36.7783, -119.4179), zoom_start=6):
         """))
 
     try:
-        fmap.fit_bounds(df[[lat_col, lon_col]].dropna().values.tolist(), padding=(30,30))
+        fmap.fit_bounds(df[[lat_col, lon_col]].dropna().values.tolist(), padding=(30, 30))
     except:
         pass
 
     return fmap
+
 
 # ---- Custom CSS layout ----
 st.markdown("""

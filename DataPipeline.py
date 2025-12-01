@@ -265,7 +265,7 @@ def merge_all_levels(county_stats_df, zip_stats_df, site_level_df):
     final_merged_df = pd.merge(merged_df, zip_stats_df, on='zip', how='inner')
     return final_merged_df
 
-def calculate_final_scores(weights, inputs):
+def calculate_final_scores(weights, inputs, top_n=None):
     # Demo Weights (add up to 1)
     Percentage_Asian_Weight = 0.30
     Median_Yearly_Population_Weight = 0.40
@@ -279,18 +279,48 @@ def calculate_final_scores(weights, inputs):
     # Site Weights (add up to 1)
     Total_Rent_Weight = 0.50  
     Avg_SqFt_Weight = 0.50
-    # has_parking_Weight =
 
     site_level_df, county_level_df, zip_level_df = data_cleaning()
-    county_level_df, zip_level_df, site_level_df = scaling(county_level_df, zip_level_df, site_level_df, inputs)
+    county_level_df, zip_level_df, site_level_df = scaling(
+        county_level_df, zip_level_df, site_level_df, inputs
+    )
     final_merged_df = merge_all_levels(county_level_df, zip_level_df, site_level_df)
 
-    final_merged_df['Demo_score'] = final_merged_df['Dummy_Percentage_Asian']*Percentage_Asian_Weight + final_merged_df['Dummy_Median_INCTOT']*Median_INCTOT_Weight + final_merged_df['Dummy_Median_Yearly_Population']*Median_Yearly_Population_Weight
-    final_merged_df['Comp_score'] = (100-final_merged_df['Scaled_Count_total_restaurant'])*Count_total_restaurant_Weight + (100-final_merged_df[f'Scaled_{inputs['Restaurant_type_input']}'])*Count_total_target_restaurant_Weight + final_merged_df['Scaled_Median_price_mid']*Median_price_mid_Weight
-    final_merged_df['Site_score'] = final_merged_df['Scaled_Avg_SqFt']*Avg_SqFt_Weight + (100-final_merged_df['Scaled_Total_Rent'])*Total_Rent_Weight
+    final_merged_df["Demo_score"] = (
+        final_merged_df["Dummy_Percentage_Asian"] * Percentage_Asian_Weight
+        + final_merged_df["Dummy_Median_INCTOT"] * Median_INCTOT_Weight
+        + final_merged_df["Dummy_Median_Yearly_Population"] * Median_Yearly_Population_Weight
+    )
 
-    final_merged_df['fit_score'] = final_merged_df['Demo_score']*weights['Demo_weight'] + final_merged_df['Comp_score']*weights['Comp_weight'] + final_merged_df['Site_score']*weights['Site_weight']
+    # NOTE: need different quotes for the f-string here
+    target_col = f"Scaled_{inputs['Restaurant_type_input']}"
+    final_merged_df["Comp_score"] = (
+        (100 - final_merged_df["Scaled_Count_total_restaurant"]) * Count_total_restaurant_Weight
+        + (100 - final_merged_df[target_col]) * Count_total_target_restaurant_Weight
+        + final_merged_df["Scaled_Median_price_mid"] * Median_price_mid_Weight
+    )
 
-    final_merged_df_sorted = final_merged_df.sort_values(by='fit_score', ascending=False).reset_index(drop=True)
+    final_merged_df["Site_score"] = (
+        final_merged_df["Scaled_Avg_SqFt"] * Avg_SqFt_Weight
+        + (100 - final_merged_df["Scaled_Total_Rent"]) * Total_Rent_Weight
+    )
+
+    final_merged_df["fit_score"] = (
+        final_merged_df["Demo_score"] * weights["Demo_weight"]
+        + final_merged_df["Comp_score"] * weights["Comp_weight"]
+        + final_merged_df["Site_score"] * weights["Site_weight"]
+    )
+
+    final_merged_df_sorted = (
+        final_merged_df.sort_values(by="fit_score", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    # assign a rank (1 = best)
+    final_merged_df_sorted["rank"] = final_merged_df_sorted.index + 1
+
+    # Optionally cut to top N
+    if top_n is not None:
+        final_merged_df_sorted = final_merged_df_sorted.head(top_n).copy()
 
     return final_merged_df_sorted
